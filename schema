@@ -1,6 +1,28 @@
-DC\nDebian 13[shape: cylinder, styleMode: watercolor, color: blue]
-"Machine Windows\nBase W2k25" [styleMode: watercolor, color: green, shape: cylinder, label: "Machine Windows\nBase W2k25"]
-"Machine Linux\nUbuntu 26.04 LTS" [styleMode: watercolor, label: "Machine Linux\nUbuntu 26.04 LTS", shape: cylinder, color: green]
+//eraser
+ADMIN-SYS [icon: user]
+INTERNET GATEWAY [icon: aws-internet-gateway]
 
-DC\nDebian 13 > Machine Linux\nUbuntu 26.04 LTS
-DC\nDebian 13 > Machine Windows\nBase W2k25
+VPC LN3 [icon: aws-vpc] {
+  SUBNET PUBLIC{
+    SSH-SRV [icon: vpn]
+    NAT-SRV [icon: gcp-cloud-nat]
+  }
+
+  SUBNET PRIVATE{
+    NTP-SRV-LIN[icon: linux]
+    NTP-CLI-LIN[icon: linux]
+    NTP-CLI-WIN[icon: windows]
+  }
+}
+
+//INBOUND
+ADMIN-SYS -> INTERNET GATEWAY
+INTERNET GATEWAY -> SSH-SRV : SSH-22
+SSH-SRV -> SUBNET PRIVATE : SSH-22, RDP-3389, NTP-123
+
+NTP-SRV-LIN -> NTP-CLI-LIN : UDP-123
+NTP-SRV-LIN -> NTP-CLI-WIN : UPD-123
+
+//OUTBOUND
+SUBNET PRIVATE -> NAT-SRV : ALL TRAFFIC
+NAT-SRV -> INTERNET GATEWAY: ALL TRAFFIC
