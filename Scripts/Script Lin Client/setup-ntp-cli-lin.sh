@@ -14,9 +14,9 @@
 set -euo pipefail
 
 # ========= Variables à adapter =========
-HOSTNAME_NEW=""              # vide = ne pas changer le nom d'hôte (ex : "ntp-cli-lin")
+HOSTNAME_NEW=""
 TIMEZONE="Europe/Zurich"     # vide = ne pas changer le fuseau horaire
-NTP_SERVER=""                # vide = serveurs Ubuntu par défaut ; sinon ex : "10.229.38.101"
+NTP_SERVER="10.0.2.10"               
 SYNC_TIMEOUT=60              # secondes d'attente max pour la synchronisation
 # ========================================
 
