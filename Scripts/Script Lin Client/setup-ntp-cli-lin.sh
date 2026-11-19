@@ -3,30 +3,36 @@
 # setup-ntp-cli-lin.sh
 # Projet  : LIN3 - déploiement NTP
 # Cible   : client Linux Ubuntu Server (ntp-cli-lin)
-# Rôle    : installe les outils de base, configure le client NTP avec
-#           systemd-timesyncd / timedatectl, puis vérifie le résultat
-#           (y compris la réception effective de paquets NTP du serveur).
+# Rôle    : met à jour le système, fixe le fuseau horaire, configure chrony
+#           avec UNIQUEMENT les serveurs NTP internes (sources par défaut
+#           neutralisées), puis vérifie le résultat (y compris la réception
+#           effective de paquets NTP).
 #
-# Usage   : ./setup-ntp-cli-lin.sh
-#           (se relance automatiquement en root via sudo)
-#
+# Usage   : ./setup-ntp-cli-lin.sh   (se relance automatiquement en root)
 # Le réseau n'est pas modifié par ce script.
 # =============================================================================
 set -euo pipefail
 
 # ========= Variables à adapter =========
-HOSTNAME_NEW=""
-TIMEZONE="Europe/Dublin"      # vide = ne pas changer le fuseau horaire
-NTP_SERVER="10.0.2.10"
-SYNC_TIMEOUT=20               # secondes d'attente max pour la synchronisation
-CAPTURE_TIMEOUT=$SYNC_TIMEOUT # durée max de la capture des paquets NTP
+TIMEZONE="Europe/Zurich"
+NTP_PRIMARY="10.0.2.10"
+NTP_FALLBACK="10.0.2.11"
+SYNC_TIMEOUT=20                 # secondes d'attente max pour la synchronisation
+CAPTURE_TIMEOUT=$SYNC_TIMEOUT   # durée max de la capture des paquets NTP
 # ========================================
+
+CONF="/etc/chrony/chrony.conf"
+SRC_DIR="/etc/chrony/sources.d"
+CONF_DIR="/etc/chrony/conf.d"
+SRC_FILE="$SRC_DIR/local-ntp.sources"
+MARK="# ajouté par setup-ntp-cli-lin.sh"
+SRV=("$NTP_PRIMARY" "$NTP_FALLBACK")
 
 # ---------- Auto-élévation en root ----------
 if [[ $EUID -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo "Élévation des privilèges via sudo..."
-    exec sudo -E bash "$0" "$@"
+    exec sudo bash "$0" "$@"
   else
     echo "Erreur : ni root ni sudo disponible. Lancez : su -c 'bash $0'" >&2
     exit 1
@@ -39,21 +45,12 @@ ok()   { echo -e "[\e[32m OK \e[0m] $1"; }
 fail() { echo -e "[\e[31mÉCHEC\e[0m] $1"; [[ -n "${2:-}" ]] && echo "         ↳ Erreur : $2"; ERRORS=$((ERRORS+1)); }
 step() { echo -e "\n\e[1m== $1 ==\e[0m"; }
 
-# ---------- 1. Nom d'hôte (optionnel) ----------
-step "1. Nom d'hôte"
-if [[ -n "$HOSTNAME_NEW" ]]; then
-  hostnamectl set-hostname "$HOSTNAME_NEW"
-  grep -q "$HOSTNAME_NEW" /etc/hosts || echo "127.0.1.1 $HOSTNAME_NEW" >> /etc/hosts
-  echo "Nom d'hôte défini : $HOSTNAME_NEW"
-else
-  echo "Inchangé : $(hostname)"
-fi
-
-# ---------- 2. Paquets nécessaires ----------
-step "2. Installation des paquets"
+# ---------- 1. Mise à jour et paquets ----------
+step "1. Mise à jour du système et paquets"
 apt-get update -y
+apt-get -y upgrade
 apt-get install -y \
-  systemd-timesyncd \
+  chrony \
   iputils-ping \
   iproute2 \
   bind9-dnsutils \
@@ -64,63 +61,74 @@ apt-get install -y \
   vim \
   tcpdump
 
-# ---------- 3. Retirer les clients NTP concurrents ----------
-step "3. Suppression des clients NTP concurrents"
-for svc in chrony ntp ntpsec; do
+# ---------- 2. Retirer les clients NTP concurrents ----------
+step "2. Suppression des clients NTP concurrents"
+for svc in ntp ntpsec; do
   if dpkg -s "$svc" >/dev/null 2>&1; then
     systemctl disable --now "$svc" 2>/dev/null || true
     apt-get purge -y "$svc"
     echo "Paquet $svc supprimé"
   fi
 done
+if systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
+  systemctl disable --now systemd-timesyncd 2>/dev/null || true
+  systemctl mask systemd-timesyncd 2>/dev/null || true
+  echo "systemd-timesyncd désactivé et masqué"
+fi
 
-# ---------- 4. Fuseau horaire ----------
-step "4. Fuseau horaire"
-if [[ -n "$TIMEZONE" ]]; then
-  if timedatectl list-timezones | grep -qx "$TIMEZONE"; then
-    timedatectl set-timezone "$TIMEZONE"
-    echo "Fuseau horaire défini : $TIMEZONE"
-  else
-    echo "Fuseau horaire inconnu : $TIMEZONE (inchangé)"
+# ---------- 3. Fuseau horaire ----------
+step "3. Fuseau horaire"
+timedatectl set-timezone "$TIMEZONE"
+echo "Fuseau horaire défini : $TIMEZONE"
+
+# ---------- 4. Configuration de chrony ----------
+step "4. Configuration de chrony"
+mkdir -p "$SRC_DIR"
+cp -a "$CONF" "$CONF.bak.$(date +%Y%m%d%H%M%S)"
+echo "Sauvegarde : $CONF.bak.*"
+
+# Retire d'abord notre ligne sourcedir d'un run précédent (idempotence)
+sed -i "\|$MARK|d" "$CONF"
+
+# Neutralise toute autre source : pool, server, peer, sourcedir (DHCP/cloud inclus)
+disable_sources() {
+  sed -i -E 's/^[[:space:]]*(pool|server|peer|sourcedir)[[:space:]]/#&/' "$1"
+}
+disable_sources "$CONF"
+for f in "$SRC_DIR"/*.sources "$CONF_DIR"/*.conf; do
+  if [[ -e "$f" && "$f" != "$SRC_FILE" ]]; then
+    disable_sources "$f"
+    echo "Sources neutralisées dans : $f"
   fi
-else
-  echo "Inchangé : $(timedatectl show -p Timezone --value)"
-fi
+done
 
-# ---------- 5. Configuration de timesyncd ----------
-step "5. Configuration de systemd-timesyncd"
-systemctl unmask systemd-timesyncd 2>/dev/null || true
-mkdir -p /etc/systemd/timesyncd.conf.d
-if [[ -n "$NTP_SERVER" ]]; then
-  cat > /etc/systemd/timesyncd.conf.d/ntp.conf <<EOF
-[Time]
-NTP=${NTP_SERVER}
-FallbackNTP=
-ConnectionRetrySec=5
+# Chrony ne lit que notre dossier de sources
+echo "sourcedir $SRC_DIR  $MARK" >> "$CONF"
+
+cat > "$SRC_FILE" <<EOF
+server ${NTP_PRIMARY}  iburst prefer minpoll 4 maxpoll 6
+server ${NTP_FALLBACK} iburst minpoll 4 maxpoll 6
 EOF
-  echo "Serveur NTP : $NTP_SERVER (sans fallback, nouvelle tentative toutes les 5 s)"
-else
-  rm -f /etc/systemd/timesyncd.conf.d/ntp.conf
-  echo "Serveurs NTP par défaut conservés"
-fi
+echo "Serveurs NTP : ${SRV[*]} (dans $SRC_FILE)"
 
-# ---------- 6. Activation ----------
-step "6. Activation du service"
-systemctl enable systemd-timesyncd
+# ---------- 5. Activation ----------
+step "5. Activation du service"
+systemctl enable chrony
 
-# Capture : 1 réponse NTP (UDP/123) provenant du serveur.
-# Lancée AVANT le redémarrage : le premier paquet part au démarrage de timesyncd.
+# Capture : 1 réponse NTP (UDP/123) d'un des serveurs, lancée AVANT le redémarrage
 CAPTURE_FILE=$(mktemp)
-TCPDUMP_PID=""
-if [[ -n "$NTP_SERVER" ]]; then
-  timeout "$CAPTURE_TIMEOUT" tcpdump -n -l -i any -c 1 \
-    "udp src port 123 and src host $NTP_SERVER" >"$CAPTURE_FILE" 2>&1 &
-  TCPDUMP_PID=$!
-  sleep 1   # laisse tcpdump s'initialiser
-fi
+HOSTS_FILTER=""
+for s in "${SRV[@]}"; do HOSTS_FILTER+="${HOSTS_FILTER:+ or }src host $s"; done
+timeout "$CAPTURE_TIMEOUT" tcpdump -n -l -i any -c 1 \
+  "udp src port 123 and ($HOSTS_FILTER)" >"$CAPTURE_FILE" 2>&1 &
+TCPDUMP_PID=$!
+sleep 1
 
-systemctl restart systemd-timesyncd
-timedatectl set-ntp true
+systemctl restart chrony
+sleep 3
+chronyc burst 4/4 >/dev/null || true
+sleep 3
+chronyc makestep || true
 
 echo "Attente de la synchronisation (max ${SYNC_TIMEOUT}s)..."
 for ((i=0; i<SYNC_TIMEOUT; i+=2)); do
@@ -128,124 +136,94 @@ for ((i=0; i<SYNC_TIMEOUT; i+=2)); do
   sleep 2
 done
 
-# ---------- 7. Vérifications ----------
-step "7. Vérifications"
+# ---------- 6. Vérifications ----------
+step "6. Vérifications"
 
-# 7.1 Outils disponibles (vérification par commande)
-for cmd in timedatectl ping ip dig curl tcpdump; do
-  if command -v "$cmd" >/dev/null 2>&1; then
-    ok "Commande $cmd disponible"
-  else
-    fail "Commande $cmd manquante" "installer le paquet qui fournit $cmd"
-  fi
+# 6.1 Outils
+for cmd in timedatectl chronyc ping ip dig curl tcpdump; do
+  if command -v "$cmd" >/dev/null 2>&1; then ok "Commande $cmd disponible"
+  else fail "Commande $cmd manquante" "installer le paquet qui fournit $cmd"; fi
 done
-if dpkg -s systemd-timesyncd >/dev/null 2>&1; then
-  ok "Paquet systemd-timesyncd installé"
-else
-  fail "Paquet systemd-timesyncd manquant" "apt-get install -y systemd-timesyncd"
-fi
+dpkg -s chrony >/dev/null 2>&1 && ok "Paquet chrony installé" \
+  || fail "Paquet chrony manquant" "apt-get install -y chrony"
 
-# 7.2 Aucun client NTP concurrent
+# 6.2 Aucun client NTP concurrent actif
 conflict=""
-for svc in chrony ntp ntpsec; do dpkg -s "$svc" >/dev/null 2>&1 && conflict+="$svc "; done
-if [[ -z "$conflict" ]]; then
-  ok "Aucun client NTP concurrent installé"
+for svc in ntp ntpsec; do dpkg -s "$svc" >/dev/null 2>&1 && conflict+="$svc "; done
+systemctl is-active --quiet systemd-timesyncd 2>/dev/null && conflict+="systemd-timesyncd "
+[[ -z "$conflict" ]] && ok "Aucun client NTP concurrent actif" \
+  || fail "Client(s) NTP concurrent(s) présent(s)" "$conflict"
+
+# 6.3 Fuseau horaire
+current_tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+[[ "$current_tz" == "$TIMEZONE" ]] && ok "Fuseau horaire : $current_tz" \
+  || fail "Fuseau horaire incorrect" "attendu $TIMEZONE, obtenu ${current_tz:-inconnu}"
+
+# 6.4 Service chrony
+if out=$(systemctl is-enabled chrony 2>&1); then ok "chrony activé au démarrage ($out)"
+else fail "chrony non activé au démarrage" "$out"; fi
+if systemctl is-active --quiet chrony; then ok "chrony en cours d'exécution"
+else fail "chrony inactif" "$(systemctl status chrony --no-pager -n 5 2>&1 | tail -n 5)"; fi
+
+# 6.5 Sources par défaut neutralisées
+active=$(grep -HE '^[[:space:]]*(pool|server|peer)[[:space:]]' \
+           "$CONF" "$CONF_DIR"/*.conf "$SRC_DIR"/*.sources 2>/dev/null \
+         | grep -v "^$SRC_FILE:" || true)
+extra_dirs=$(grep -hE '^[[:space:]]*sourcedir[[:space:]]' \
+               "$CONF" "$CONF_DIR"/*.conf 2>/dev/null \
+             | grep -v "sourcedir $SRC_DIR " || true)
+if [[ -z "$active" && -z "$extra_dirs" ]]; then
+  ok "Aucune source par défaut active (seul $SRC_DIR est lu)"
 else
-  fail "Client(s) NTP concurrent(s) présent(s)" "$conflict"
+  fail "Source(s) par défaut encore active(s)" "$active $extra_dirs"
 fi
 
-# 7.3 Fuseau horaire
-if [[ -n "$TIMEZONE" ]]; then
-  current_tz=$(timedatectl show -p Timezone --value 2>/dev/null)
-  if [[ "$current_tz" == "$TIMEZONE" ]]; then
-    ok "Fuseau horaire : $current_tz"
-  else
-    fail "Fuseau horaire incorrect" "attendu $TIMEZONE, obtenu ${current_tz:-inconnu}"
-  fi
-fi
+# 6.6 Connectivité vers chaque serveur
+for s in "${SRV[@]}"; do
+  if out=$(ping -c 2 -W 2 "$s" 2>&1); then ok "Serveur de temps $s joignable"
+  else fail "Serveur de temps $s injoignable au ping (ICMP parfois filtré)" "$(echo "$out" | tail -n 2)"; fi
+done
 
-# 7.4 Service timesyncd enabled / active
-if out=$(systemctl is-enabled systemd-timesyncd 2>&1); then
-  ok "systemd-timesyncd activé au démarrage ($out)"
-else
-  fail "systemd-timesyncd non activé au démarrage" "$out"
-fi
-if systemctl is-active --quiet systemd-timesyncd; then
-  ok "systemd-timesyncd en cours d'exécution"
-else
-  fail "systemd-timesyncd inactif" "$(systemctl status systemd-timesyncd --no-pager -n 5 2>&1 | tail -n 5)"
-fi
+# 6.7 Sources chrony = exactement nos serveurs
+got=$(chronyc -c sources 2>/dev/null | awk -F, '{print $3}' | sort | tr '\n' ' ' || true)
+want=$(printf '%s\n' "${SRV[@]}" | sort | tr '\n' ' ')
+if [[ "$got" == "$want" ]]; then ok "Sources chrony : $got"
+else fail "Sources chrony différentes de celles configurées" "attendu : $want| obtenu : ${got:-vide}"; fi
 
-# 7.5 NTP activé dans timedatectl
-if [[ "$(timedatectl show -p NTP --value 2>/dev/null)" == "yes" ]]; then
-  ok "NTP activé (timedatectl set-ntp)"
-else
-  fail "NTP désactivé dans timedatectl" "$(timedatectl status 2>&1 | grep -i 'NTP service')"
-fi
-
-# 7.6 Connectivité vers le serveur de temps
-TARGET="${NTP_SERVER:-ntp.ubuntu.com}"
-if out=$(ping -c 2 -W 2 "$TARGET" 2>&1); then
-  ok "Serveur de temps $TARGET joignable"
-else
-  fail "Serveur de temps $TARGET injoignable au ping (ICMP parfois filtré)" "$(echo "$out" | tail -n 2)"
-fi
-
-# 7.7 Serveur configuré
-if [[ -n "$NTP_SERVER" ]]; then
-  cfg=$(timedatectl show-timesync -p SystemNTPServers --value 2>&1 || true)
-  if [[ "$cfg" == *"$NTP_SERVER"* ]]; then
-    ok "Serveur NTP configuré : $cfg"
-  else
-    fail "Serveur NTP $NTP_SERVER non pris en compte" "SystemNTPServers = ${cfg:-vide}"
-  fi
-fi
-
-# 7.8 Synchronisation
+# 6.8 Synchronisation
 if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
   ok "Horloge synchronisée (System clock synchronized: yes)"
-  timedatectl timesync-status 2>/dev/null | grep -E "Server|Stratum|Offset" || true
+  chronyc tracking 2>/dev/null | grep -E "Reference ID|Stratum|System time|Leap status" || true
 else
   fail "Horloge non synchronisée après ${SYNC_TIMEOUT}s" \
-       "$(timedatectl timesync-status 2>&1 | head -n 6) | logs : journalctl -u systemd-timesyncd -n 10"
+       "$(chronyc tracking 2>&1 | head -n 6) | logs : journalctl -u chrony -n 10"
 fi
 
-# 7.9 Réception effective de paquets NTP depuis le serveur
-if [[ -n "$NTP_SERVER" ]]; then
-  # a) Preuve réseau : une réponse UDP/123 du serveur a été vue
-  [[ -n "$TCPDUMP_PID" ]] && { wait "$TCPDUMP_PID" 2>/dev/null || true; }
-  if grep -q "NTP" "$CAPTURE_FILE"; then
-    ok "Paquet NTP reçu de $NTP_SERVER (capture tcpdump)"
-    grep "NTP" "$CAPTURE_FILE" | head -n 1 | sed 's/^/         ↳ /'
-  else
-    fail "Aucun paquet NTP reçu de $NTP_SERVER en ${CAPTURE_TIMEOUT}s" \
-         "service NTP arrêté sur le serveur ? UDP/123 filtré ? (voir $CAPTURE_FILE)"
-  fi
-
-  # b) Preuve côté client : compteur de paquets de timesyncd
-  pkt=$(timedatectl timesync-status 2>/dev/null | awk '/Packet count/{print $3}')
-  if [[ "${pkt:-0}" -gt 0 ]]; then
-    ok "timesyncd a traité $pkt paquet(s) NTP"
-  else
-    fail "Compteur de paquets NTP à 0" "timesyncd n'a reçu aucune réponse valide"
-  fi
-
-  # c) Le serveur qui répond est bien celui configuré
-  srv=$(timedatectl timesync-status 2>/dev/null | awk -F': ' '/Server:/{print $2}')
-  if [[ "$srv" == *"$NTP_SERVER"* ]]; then
-    ok "Serveur utilisé par timesyncd : $srv"
-  else
-    fail "Serveur utilisé différent de $NTP_SERVER" "obtenu : ${srv:-aucun}"
-  fi
+# 6.9 Réception effective de paquets NTP
+wait "$TCPDUMP_PID" 2>/dev/null || true
+if grep -q "NTP" "$CAPTURE_FILE"; then
+  ok "Paquet NTP reçu d'un serveur configuré (capture tcpdump)"
+  grep "NTP" "$CAPTURE_FILE" | head -n 1 | sed 's/^/         ↳ /'
+else
+  fail "Aucun paquet NTP reçu de ${SRV[*]} en ${CAPTURE_TIMEOUT}s" \
+       "service NTP arrêté sur le serveur ? UDP/123 filtré ? (voir $CAPTURE_FILE)"
 fi
+
+for s in "${SRV[@]}"; do
+  reach=$(chronyc -c sources 2>/dev/null | awk -F, -v s="$s" '$3==s{print $6}')
+  if [[ -n "$reach" && "$reach" != "0" ]]; then ok "chrony a reçu des réponses de $s (Reach = $reach)"
+  else fail "Reach à 0 pour $s" "chrony n'a reçu aucune réponse valide"; fi
+done
+
+sel=$(chronyc -c sources 2>/dev/null | awk -F, '$2=="*"{print $3}')
+if [[ -n "$sel" && " ${SRV[*]} " == *" $sel "* ]]; then ok "Serveur sélectionné par chrony : $sel"
+else fail "Aucun serveur configuré n'est sélectionné par chrony" "obtenu : ${sel:-aucun}"; fi
 rm -f "${CAPTURE_FILE:-}"
 
 # ---------- Bilan ----------
 echo "-----------------------------------------"
-if [[ $ERRORS -eq 0 ]]; then
-  echo -e "\e[32mTous les contrôles sont passés.\e[0m"
-else
-  echo -e "\e[31m$ERRORS contrôle(s) en échec.\e[0m"
-fi
+if [[ $ERRORS -eq 0 ]]; then echo -e "\e[32mTous les contrôles sont passés.\e[0m"
+else echo -e "\e[31m$ERRORS contrôle(s) en échec.\e[0m"; fi
+echo; chronyc sources -v; chronyc tracking
 echo; timedatectl status
 exit $ERRORS
