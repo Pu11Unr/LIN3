@@ -4,7 +4,8 @@
 # Projet  : LIN3 - déploiement NTP
 # Cible   : client Linux Ubuntu Server (ntp-cli-lin)
 # Rôle    : installe les outils de base, configure le client NTP avec
-#           systemd-timesyncd / timedatectl, puis vérifie le résultat.
+#           systemd-timesyncd / timedatectl, puis vérifie le résultat
+#           (y compris la réception effective de paquets NTP du serveur).
 #
 # Usage   : ./setup-ntp-cli-lin.sh
 #           (se relance automatiquement en root via sudo)
@@ -15,9 +16,10 @@ set -euo pipefail
 
 # ========= Variables à adapter =========
 HOSTNAME_NEW=""
-TIMEZONE="Europe/Dublin"     # vide = ne pas changer le fuseau horaire
-NTP_SERVER="10.0.2.10"               
-SYNC_TIMEOUT=60              # secondes d'attente max pour la synchronisation
+TIMEZONE="Europe/Dublin"      # vide = ne pas changer le fuseau horaire
+NTP_SERVER="10.0.2.10"
+SYNC_TIMEOUT=20               # secondes d'attente max pour la synchronisation
+CAPTURE_TIMEOUT=$SYNC_TIMEOUT # durée max de la capture des paquets NTP
 # ========================================
 
 # ---------- Auto-élévation en root ----------
@@ -94,8 +96,9 @@ if [[ -n "$NTP_SERVER" ]]; then
 [Time]
 NTP=${NTP_SERVER}
 FallbackNTP=
+ConnectionRetrySec=5
 EOF
-  echo "Serveur NTP : $NTP_SERVER (sans fallback)"
+  echo "Serveur NTP : $NTP_SERVER (sans fallback, nouvelle tentative toutes les 5 s)"
 else
   rm -f /etc/systemd/timesyncd.conf.d/ntp.conf
   echo "Serveurs NTP par défaut conservés"
@@ -104,20 +107,32 @@ fi
 # ---------- 6. Activation ----------
 step "6. Activation du service"
 systemctl enable systemd-timesyncd
+
+# Capture : 1 réponse NTP (UDP/123) provenant du serveur.
+# Lancée AVANT le redémarrage : le premier paquet part au démarrage de timesyncd.
+CAPTURE_FILE=$(mktemp)
+TCPDUMP_PID=""
+if [[ -n "$NTP_SERVER" ]]; then
+  timeout "$CAPTURE_TIMEOUT" tcpdump -n -l -i any -c 1 \
+    "udp src port 123 and src host $NTP_SERVER" >"$CAPTURE_FILE" 2>&1 &
+  TCPDUMP_PID=$!
+  sleep 1   # laisse tcpdump s'initialiser
+fi
+
 systemctl restart systemd-timesyncd
 timedatectl set-ntp true
 
 echo "Attente de la synchronisation (max ${SYNC_TIMEOUT}s)..."
-for ((i=0; i<SYNC_TIMEOUT; i+=3)); do
+for ((i=0; i<SYNC_TIMEOUT; i+=2)); do
   [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] && break
-  sleep 3
+  sleep 2
 done
 
 # ---------- 7. Vérifications ----------
 step "7. Vérifications"
 
 # 7.1 Outils disponibles (vérification par commande)
-for cmd in timedatectl ping ip dig curl; do
+for cmd in timedatectl ping ip dig curl tcpdump; do
   if command -v "$cmd" >/dev/null 2>&1; then
     ok "Commande $cmd disponible"
   else
@@ -194,6 +209,36 @@ else
   fail "Horloge non synchronisée après ${SYNC_TIMEOUT}s" \
        "$(timedatectl timesync-status 2>&1 | head -n 6) | logs : journalctl -u systemd-timesyncd -n 10"
 fi
+
+# 7.9 Réception effective de paquets NTP depuis le serveur
+if [[ -n "$NTP_SERVER" ]]; then
+  # a) Preuve réseau : une réponse UDP/123 du serveur a été vue
+  [[ -n "$TCPDUMP_PID" ]] && { wait "$TCPDUMP_PID" 2>/dev/null || true; }
+  if grep -q "NTP" "$CAPTURE_FILE"; then
+    ok "Paquet NTP reçu de $NTP_SERVER (capture tcpdump)"
+    grep "NTP" "$CAPTURE_FILE" | head -n 1 | sed 's/^/         ↳ /'
+  else
+    fail "Aucun paquet NTP reçu de $NTP_SERVER en ${CAPTURE_TIMEOUT}s" \
+         "service NTP arrêté sur le serveur ? UDP/123 filtré ? (voir $CAPTURE_FILE)"
+  fi
+
+  # b) Preuve côté client : compteur de paquets de timesyncd
+  pkt=$(timedatectl timesync-status 2>/dev/null | awk '/Packet count/{print $3}')
+  if [[ "${pkt:-0}" -gt 0 ]]; then
+    ok "timesyncd a traité $pkt paquet(s) NTP"
+  else
+    fail "Compteur de paquets NTP à 0" "timesyncd n'a reçu aucune réponse valide"
+  fi
+
+  # c) Le serveur qui répond est bien celui configuré
+  srv=$(timedatectl timesync-status 2>/dev/null | awk -F': ' '/Server:/{print $2}')
+  if [[ "$srv" == *"$NTP_SERVER"* ]]; then
+    ok "Serveur utilisé par timesyncd : $srv"
+  else
+    fail "Serveur utilisé différent de $NTP_SERVER" "obtenu : ${srv:-aucun}"
+  fi
+fi
+rm -f "${CAPTURE_FILE:-}"
 
 # ---------- Bilan ----------
 echo "-----------------------------------------"
