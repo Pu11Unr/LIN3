@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ========= Variables à adapter =========
 HOSTNAME_NEW=""
-TIMEZONE="Europe/Zurich"     # vide = ne pas changer le fuseau horaire
+TIMEZONE="Europe/Dublin"     # vide = ne pas changer le fuseau horaire
 NTP_SERVER="10.0.2.10"               
 SYNC_TIMEOUT=60              # secondes d'attente max pour la synchronisation
 # ========================================
