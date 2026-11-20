@@ -1,140 +1,229 @@
-# ==============================
-# Script de validation NTP - Windows
-# Projet LIN3 - Client et serveur NTP secondaire
-# PowerShell -ExecutionPolicy Bypass -File validate_ntp_windows.ps1
-# ==============================
-
-# ==============================
-# Chargement du fichier .env et verification des droits
-# ==============================
+﻿# LIN3 - Validation NTP Windows V4 / PowerShell 5.1
+# Normal : source principale ; Failover : secours pendant panne ; Recovery : retour.
+# Any : l'une des sources configurees. Aucun redemarrage ni resync force.
+[CmdletBinding()]
+param([ValidateSet('Normal','Failover','Recovery','Any')][string]$Mode = 'Normal',
+      [ValidateRange(0,7200)][int]$WaitSeconds = 0)
 $ErrorActionPreference = 'Stop'
-$EnvFile = Join-Path $PSScriptRoot '.env.windows.txt'
-
-function Read-NtpConfig {
-    if (-not (Test-Path -LiteralPath $EnvFile)) {
-        throw 'Fichier .env.windows.txt introuvable. Copier env.windows.template vers .env.windows.txt.'
-    }
-    $config = @{}
-    foreach ($line in (Get-Content -LiteralPath $EnvFile)) {
-        if ($line -match '^\s*(#|$)') { continue }
-        $parts = $line -split '=', 2
-        if ($parts.Count -ne 2) { throw "Ligne de configuration invalide : $line" }
-        $key = $parts[0].Trim()
-        if ($config.ContainsKey($key)) { throw "Variable en double : $key" }
-        $config[$key] = $parts[1].Trim()
-    }
-    foreach ($key in @('NTP_PRIMARY_SERVER','NTP_BACKUP_SERVER','NTP_ALLOWED_SUBNET','NTP_MIN_POLL_INTERVAL','NTP_MAX_POLL_INTERVAL','NTP_UPDATE_INTERVAL')) {
-        if (-not $config.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($config[$key])) { throw "Variable manquante : $key" }
-    }
-    foreach ($key in @('NTP_PRIMARY_SERVER','NTP_BACKUP_SERVER')) {
-        if ($config[$key] -notmatch '^[a-zA-Z0-9][a-zA-Z0-9.:-]*$') { throw "Source NTP invalide : $key" }
-    }
-    if ($config.NTP_PRIMARY_SERVER -eq $config.NTP_BACKUP_SERVER) { throw 'Les deux sources doivent etre differentes.' }
-    foreach ($key in @('NTP_MIN_POLL_INTERVAL','NTP_MAX_POLL_INTERVAL','NTP_UPDATE_INTERVAL')) {
-        $value = 0
-        if (-not [int]::TryParse($config[$key], [ref]$value)) { throw "Valeur numerique invalide : $key" }
-        $config[$key] = $value
-    }
-    if ($config.NTP_MIN_POLL_INTERVAL -lt 6 -or $config.NTP_MAX_POLL_INTERVAL -gt 15 -or $config.NTP_MIN_POLL_INTERVAL -gt $config.NTP_MAX_POLL_INTERVAL -or $config.NTP_UPDATE_INTERVAL -lt 1) { throw 'Intervalles NTP invalides.' }
-    if ($config.NTP_ALLOWED_SUBNET -eq 'Any' -or $config.NTP_ALLOWED_SUBNET -eq '*') { throw 'Une plage reseau restreinte est requise.' }
-    return $config
-}
-
-function Assert-Administrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'Executer ce script en tant qu Administrateur.'
-    }
-}
-
 $Base = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time'
-$RuleName = 'LIN3 - NTP Server'
-
-$script:Errors = 0
-function Test-Result {
-    param([bool]$Passed, [string]$Message)
-    if ($Passed) { Write-Host "[OK] $Message" -ForegroundColor Green }
-    else { Write-Host "[ERREUR] $Message" -ForegroundColor Red; $script:Errors++ }
+$RuleName = 'LIN3-NTP-Server'
+$DisplayName = 'LIN3 - NTP Server'
+function Assert-Administrator {
+    $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Ouvrir PowerShell en administrateur.' }
 }
-
+function Read-NtpConfig {
+    $path = Join-Path $PSScriptRoot '.env.windows.txt'
+    if (-not (Test-Path -LiteralPath $path)) { throw 'Copier env.windows.template vers .env.windows.txt.' }
+    $c = @{}
+    foreach ($line in Get-Content -LiteralPath $path) {
+        if ($line -match '^\s*(#|$)') { continue }
+        $parts = $line -split '=',2
+        if ($parts.Count -ne 2) { throw "Ligne invalide : $line" }
+        $key = $parts[0].Trim()
+        if ($c.ContainsKey($key)) { throw "Variable en double : $key" }
+        $value = ($parts[1] -replace '\s+#.*$','').Trim()
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) { $value = $value.Substring(1,$value.Length-2) }
+        $c[$key] = $value
+    }
+    foreach ($key in @('TZ_NAME','NTP_PRIMARY_SERVER','NTP_POOL','NTP_ALLOWED_SUBNET')) {
+        if (-not $c[$key]) { throw "Variable manquante : $key" }
+    }
+    foreach ($key in @('NTP_PRIMARY_SERVER','NTP_POOL')) {
+        if ($c[$key] -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$') { throw "Adresse IPv4 ou nom DNS invalide : $key" }
+    }
+    $backupHosts = @()
+    if ($c.ContainsKey('NTP_SERVERS') -and $c.NTP_SERVERS.Trim()) {
+        $backupHosts = @($c.NTP_SERVERS.Trim() -split '\s+' | Where-Object { $_ })
+    }
+    $backupHosts = @($backupHosts + @($c.NTP_POOL) | Select-Object -Unique)
+    foreach ($hostName in $backupHosts) {
+        if ($hostName -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$') { throw "Adresse de secours invalide : $hostName" }
+        if ($hostName -eq $c.NTP_PRIMARY_SERVER) { throw 'Source principale incluse dans les secours.' }
+    }
+    $c['BACKUP_HOSTS'] = $backupHosts
+    if ($c.NTP_ALLOWED_SUBNET -ne 'LocalSubnet') {
+        $p = $c.NTP_ALLOWED_SUBNET -split '/'
+        $a = $null; $prefix = 0
+        if ($p.Count -ne 2 -or -not [Net.IPAddress]::TryParse($p[0],[ref]$a) -or $a.AddressFamily -ne 'InterNetwork' -or -not [int]::TryParse($p[1],[ref]$prefix) -or $prefix -lt 1 -or $prefix -gt 32) { throw 'Plage attendue : LocalSubnet ou CIDR IPv4 restreint.' }
+    }
+    $zone = @(Get-TimeZone -ListAvailable | Where-Object Id -eq $c.TZ_NAME)
+    if ($zone.Count -ne 1) { throw "Fuseau Windows invalide : $($c.TZ_NAME)" }
+    $defaults = @{NTP_MIN_POLL_INTERVAL=6; NTP_MAX_POLL_INTERVAL=6; NTP_UPDATE_INTERVAL=100; NTP_ANNOUNCE_FLAGS=10; NTP_EVENT_LOG_FLAGS=3; NTP_DISABLE_VMIC=1; NTP_MAX_ROOT_DISTANCE=5; NTP_INSTALL_WAIT_SECONDS=120}
+    foreach ($key in $defaults.Keys) {
+        if (-not $c.ContainsKey($key)) { $c[$key] = $defaults[$key] }
+        $n = 0
+        if (-not [int]::TryParse([string]$c[$key],[ref]$n)) { throw "Valeur invalide : $key" }
+        $c[$key] = $n
+    }
+    if ($c.NTP_MIN_POLL_INTERVAL -lt 6 -or $c.NTP_MAX_POLL_INTERVAL -gt 15 -or $c.NTP_MIN_POLL_INTERVAL -gt $c.NTP_MAX_POLL_INTERVAL -or $c.NTP_UPDATE_INTERVAL -lt 1 -or $c.NTP_ANNOUNCE_FLAGS -ne 10 -or $c.NTP_EVENT_LOG_FLAGS -ne 3 -or $c.NTP_DISABLE_VMIC -notin @(0,1) -or $c.NTP_MAX_ROOT_DISTANCE -lt 1 -or $c.NTP_MAX_ROOT_DISTANCE -gt 5 -or $c.NTP_INSTALL_WAIT_SECONDS -lt 0 -or $c.NTP_INSTALL_WAIT_SECONDS -gt 3600) { throw 'Parametres NTP hors limites.' }
+    return $c
+}
+function Invoke-W32Time([string[]]$Arguments) {
+    $out = & w32tm.exe @Arguments 2>&1
+    $code = $LASTEXITCODE
+    $out | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0) { throw "w32tm : code $code" }
+}
+function Start-NtpLog([string]$Name) {
+    $dir = Join-Path $PSScriptRoot 'logs'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Start-Transcript -Path (Join-Path $dir ("{0}-{1}.log" -f $Name,(Get-Date -Format 'yyyyMMdd-HHmmss-fff'))) | Out-Null
+}
+$script:Errors = 0
+function Test-Result([bool]$Passed,[string]$Message) {
+    if ($Passed) { Write-Host "[OK] $Message" -ForegroundColor Green }
+    else { Write-Host "[ECHEC] $Message" -ForegroundColor Red; $script:Errors++ }
+}
+function Get-IPv4([string]$Name) {
+    try { [Net.Dns]::GetHostAddresses($Name) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 4 }
+    catch { Write-Warning "Resolution DNS impossible : $Name" }
+}
+function Read-U32([byte[]]$Bytes,[int]$Index) {
+    return ([double]$Bytes[$Index]*16777216 + [double]$Bytes[($Index+1)]*65536 + [double]$Bytes[($Index+2)]*256 + [double]$Bytes[($Index+3)])
+}
+# Sonde NTP UDP reelle : verifie mode, originate timestamp, leap, stratum et distance.
+# La socket utilise un port source ephemere ; elle ne change pas l'heure Windows.
+function Get-NtpProbe([string]$Name) {
+    $result = $null
+    $last = 'Aucune adresse IPv4 ou reponse UDP.'
+    foreach ($ip in @(Get-IPv4 $Name)) {
+        $udp = $null
+        try {
+            $udp = New-Object Net.Sockets.UdpClient
+            $udp.Client.ReceiveTimeout = 2500
+            $udp.Connect($ip,123)
+            $packet = New-Object byte[] 48
+            $packet[0] = 0x23 # NTPv4, mode client
+            $epoch = [datetime]::SpecifyKind([datetime]'1900-01-01',[DateTimeKind]::Utc)
+            $now = ([datetime]::UtcNow - $epoch).TotalSeconds
+            $sec = [uint32]([math]::Floor($now) % 4294967296)
+            $frac = [uint32][math]::Floor(($now - [math]::Floor($now))*4294967296)
+            $a = [BitConverter]::GetBytes($sec); [array]::Reverse($a); [array]::Copy($a,0,$packet,40,4)
+            $a = [BitConverter]::GetBytes($frac); [array]::Reverse($a); [array]::Copy($a,0,$packet,44,4)
+            [void]$udp.Send($packet,$packet.Length)
+            $remote = New-Object Net.IPEndPoint([Net.IPAddress]::Any,0)
+            $reply = $udp.Receive([ref]$remote)
+            if ($reply.Length -lt 48 -or ($reply[0] -band 7) -ne 4) { throw 'Reponse NTP invalide.' }
+            for ($i=0; $i -lt 8; $i++) { if ($reply[(24+$i)] -ne $packet[(40+$i)]) { throw 'Originate timestamp invalide.' } }
+            $leap = $reply[0] -shr 6; $stratum = [int]$reply[1]
+            $delay = Read-U32 $reply 4
+            if ($delay -ge 2147483648) { $delay -= 4294967296 }
+            $delay /= 65536
+            $disp = (Read-U32 $reply 8)/65536
+            $distance = [math]::Max(0,$delay)/2 + $disp
+            $ref = Read-U32 $reply 16
+            $age = ($now - $ref) % 4294967296
+            if ($age -gt 2147483648) { $age -= 4294967296 }
+            $valid = $leap -ne 3 -and $stratum -ge 1 -and $stratum -le 15 -and ($ref -ne 0 -or (Read-U32 $reply 20) -ne 0) -and ((Read-U32 $reply 40) -ne 0 -or (Read-U32 $reply 44) -ne 0)
+            $result = [pscustomobject]@{Name=$Name; IP=[string]$ip; Responded=$true; Valid=$valid; Leap=$leap; Stratum=$stratum; RootDelay=$delay; RootDispersion=$disp; RootDistance=$distance; ReferenceAge=$age; Error=''}
+            if ($valid) { return $result }
+            $last = "Reponse non synchronisee : leap=$leap, stratum=$stratum"
+        } catch { $last = $_.Exception.Message }
+        finally { if ($null -ne $udp) { $udp.Close() } }
+    }
+    if ($null -ne $result) { return $result }
+    return [pscustomobject]@{Name=$Name; IP=''; Responded=$false; Valid=$false; Leap=-1; Stratum=0; RootDelay=0; RootDispersion=0; RootDistance=0; ReferenceAge=-1; Error=$last}
+}
+function Show-Probe($p) {
+    if ($p.Responded) { Write-Host ("{0} ({1}) : leap={2}, stratum={3}, dispersion={4:F6}s, distance annoncee={5:F6}s, ref_age={6:F1}s" -f $p.Name,$p.IP,$p.Leap,$p.Stratum,$p.RootDispersion,$p.RootDistance,$p.ReferenceAge) }
+    else { Write-Host "$($p.Name) : aucune reponse NTP validee ($($p.Error))" }
+}
+function Test-SourceName([string]$Actual,[string]$Expected) {
+    if ($Actual.TrimEnd('.') -ieq $Expected.TrimEnd('.')) { return $true }
+    $addresses = @(Get-IPv4 $Expected | ForEach-Object { $_.IPAddressToString })
+    return ($addresses -contains $Actual)
+}
+$exitCode = 1; $logging = $false
 try {
     Assert-Administrator
     $Cfg = Read-NtpConfig
-    Write-Host '===============================' -ForegroundColor Cyan
-    Write-Host ' Validation NTP - Windows (fonctionnement normal)'
-    Write-Host '===============================' -ForegroundColor Cyan
-
-    # 1. Service Windows Time
-    Write-Host '[1/6] Verification du service Windows Time...'
+    Start-NtpLog "validate-$Mode"; $logging = $true
+    Write-Host "LIN3 | Validation NTP V4 | Mode $Mode" -ForegroundColor Cyan
+    Write-Host '[1/5] Service, fournisseurs et configuration...'
+    Test-Result ((Get-TimeZone).Id -eq $Cfg.TZ_NAME) "Fuseau horaire : $($Cfg.TZ_NAME)"
     $svc = Get-CimInstance Win32_Service -Filter "Name='W32Time'"
-    Test-Result ($svc.State -eq 'Running' -and $svc.StartMode -eq 'Auto') 'Service W32Time actif et automatique'
-
-    # 2. Sources et fournisseurs NTP
-    Write-Host '[2/6] Verification des sources et fournisseurs NTP...'
-    $parameters = Get-ItemProperty "$Base\Parameters"
-    $peers = @($parameters.NtpServer -split '\s+' | Where-Object { $_ })
-    Test-Result ($parameters.Type -eq 'NTP' -and $peers.Count -eq 2 -and $peers -contains "$($Cfg.NTP_PRIMARY_SERVER),0x8" -and $peers -contains "$($Cfg.NTP_BACKUP_SERVER),0xA") 'Sources principale et de secours configurees'
-    foreach ($provider in @('NtpClient','NtpServer')) {
-        $enabled = (Get-ItemProperty "$Base\TimeProviders\$provider").Enabled
-        Test-Result ($enabled -eq 1) "$provider active"
-    }
-    $peerOutput = & w32tm.exe /query /peers
-    $peerCode = $LASTEXITCODE
-    $peerOutput | Write-Host
-    Test-Result ($peerCode -eq 0) 'Liste des pairs accessible (etat affiche ci-dessus)'
-
-    # 3. Parametres de synchronisation
-    Write-Host '[3/6] Verification des intervalles...'
+    Test-Result ($svc.State -eq 'Running' -and $svc.StartMode -eq 'Auto') 'W32Time actif et automatique'
+    $p = Get-ItemProperty "$Base\Parameters"
+    $peers = @($p.NtpServer -split '\s+' | Where-Object { $_ })
+    $expectedPeers = @("$($Cfg.NTP_PRIMARY_SERVER),0x8") + @($Cfg.BACKUP_HOSTS | ForEach-Object { "$_,0xA" })
+    $unexpectedPeers = @($peers | Where-Object { $_ -notin $expectedPeers })
+    $missingPeers = @($expectedPeers | Where-Object { $_ -notin $peers })
+    Test-Result ($p.Type -eq 'NTP' -and $peers.Count -eq $expectedPeers.Count -and $unexpectedPeers.Count -eq 0 -and $missingPeers.Count -eq 0) 'Sources principale et secours (0x8 / 0xA)'
+    foreach ($provider in @('NtpClient','NtpServer')) { Test-Result ((Get-ItemProperty "$Base\TimeProviders\$provider").Enabled -eq 1) "$provider active" }
+    $nc = Get-ItemProperty "$Base\TimeProviders\NtpClient"
+    Test-Result ($nc.InputProvider -eq 1 -and $nc.EventLogFlags -eq $Cfg.NTP_EVENT_LOG_FLAGS) 'InputProvider et journalisation NtpClient'
     $settings = Get-ItemProperty "$Base\Config"
-    Test-Result ($settings.MinPollInterval -eq $Cfg.NTP_MIN_POLL_INTERVAL -and $settings.MaxPollInterval -eq $Cfg.NTP_MAX_POLL_INTERVAL -and $settings.UpdateInterval -eq $Cfg.NTP_UPDATE_INTERVAL) 'Intervalles et UpdateInterval conformes'
-
-    # 4. Port UDP 123 et pare-feu
-    Write-Host '[4/6] Verification du port et du pare-feu...'
-    $endpoint = @(Get-NetUDPEndpoint -LocalPort 123 -ErrorAction SilentlyContinue | Where-Object OwningProcess -eq $svc.ProcessId)
-    Test-Result ($endpoint.Count -gt 0 -and $svc.ProcessId -gt 0) 'Port UDP 123 ouvert par le processus W32Time'
-    $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object DisplayName -eq $RuleName)
-    $valid = $rules.Count -gt 0
-    foreach ($rule in $rules) {
-        $port = $rule | Get-NetFirewallPortFilter
-        $address = $rule | Get-NetFirewallAddressFilter
-        $expected = $Cfg.NTP_ALLOWED_SUBNET
-        $actual = @($address.RemoteAddress)
-        $matches = ($actual.Count -eq 1 -and $actual[0] -eq $expected)
-        if ($expected -eq 'LocalSubnet' -and $actual.Count -gt 0 -and @($actual | Where-Object { $_ -notin @('LocalSubnet','LocalSubnet4','LocalSubnet6') }).Count -eq 0) { $matches = $true }
-        if ($rule.Enabled -ne 'True' -or $rule.Direction -ne 'Inbound' -or $rule.Action -ne 'Allow' -or $rule.Profile -ne 'Any' -or $port.Protocol -notin @('UDP','17') -or [string]$port.LocalPort -ne '123' -or -not $matches) { $valid = $false }
+    Test-Result ($settings.MinPollInterval -eq $Cfg.NTP_MIN_POLL_INTERVAL -and $settings.MaxPollInterval -eq $Cfg.NTP_MAX_POLL_INTERVAL -and $settings.UpdateInterval -eq $Cfg.NTP_UPDATE_INTERVAL -and $settings.AnnounceFlags -eq $Cfg.NTP_ANNOUNCE_FLAGS) 'Intervalles, ajustement et annonce automatique'
+    $vmic = "$Base\TimeProviders\VMICTimeProvider"
+    if ($Cfg.NTP_DISABLE_VMIC -eq 1 -and (Test-Path $vmic)) { Test-Result ((Get-ItemProperty $vmic).Enabled -eq 0) 'Fournisseur VMIC desactive' }
+    $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\W32Time'
+    if (Test-Path $policy) { Test-Result ((Get-Item $policy).ValueCount -eq 0 -and @(Get-ChildItem $policy -Recurse | Where-Object { $_.ValueCount -gt 0 }).Count -eq 0) 'Aucune GPO W32Time concurrente' }
+    Invoke-W32Time -Arguments @('/query','/configuration')
+    Invoke-W32Time -Arguments @('/query','/peers')
+    Write-Host '[2/5] Ecoute UDP 123 et pare-feu effectif...'
+    $ep = @(Get-NetUDPEndpoint -LocalPort 123 -ErrorAction SilentlyContinue | Where-Object OwningProcess -eq $svc.ProcessId)
+    Test-Result ($ep.Count -gt 0 -and $svc.ProcessId -gt 0) 'W32Time ecoute UDP 123'
+    $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object Name -eq $RuleName)
+    $validRule = $false
+    if ($rules.Count -eq 1) {
+        $r = $rules[0]; $port = $r | Get-NetFirewallPortFilter; $addr = $r | Get-NetFirewallAddressFilter
+        $actual = @($addr.RemoteAddress); $expected = $Cfg.NTP_ALLOWED_SUBNET
+        $match = $actual.Count -eq 1 -and $actual[0] -eq $expected
+        if ($expected -eq 'LocalSubnet') { $match = $actual.Count -gt 0 -and @($actual | Where-Object { $_ -notin @('LocalSubnet','LocalSubnet4','LocalSubnet6') }).Count -eq 0 }
+        # Windows peut normaliser CIDR en adresse/masque.
+        if (-not $match -and $expected -match '/') {
+            $parts = $expected -split '/'; $bits = [int]$parts[1]
+            $mask = (0..3 | ForEach-Object { $n=[math]::Min(8,[math]::Max(0,$bits-8*$_)); [int](256-[math]::Pow(2,8-$n)) }) -join '.'
+            $match = $actual.Count -eq 1 -and $actual[0] -eq "$($parts[0])/$mask"
+        }
+        $validRule = $r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Allow' -and $r.Profile -eq 'Any' -and $port.Protocol -in @('UDP','17') -and [string]$port.LocalPort -eq '123' -and $match
     }
-    Test-Result $valid 'Regle active UDP 123 conforme a la plage autorisee'
-
-    # 5. Source NTP active et etat de synchronisation
-    Write-Host '[5/6] Verification de la synchronisation normale...'
-    $source = & w32tm.exe /query /source
-    $sourceCode = $LASTEXITCODE
-    $sourceText = ($source -join ' ').Trim()
-    Write-Host "Source actuelle : $sourceText"
-    Test-Result ($sourceCode -eq 0 -and ($sourceText -split ',')[0] -eq $Cfg.NTP_PRIMARY_SERVER) 'Source principale selectionnee'
-    $status = & w32tm.exe /query /status /verbose
-    $statusCode = $LASTEXITCODE
-    $status | Write-Host
-    Test-Result ($statusCode -eq 0) 'Etat W32Time accessible (precision et leap affiches ci-dessus)'
-
-    # 6. Test NTP reel vers les sources (UDP, sans modifier l'heure)
-    Write-Host '[6/6] Verification de la reponse NTP des deux sources...'
-    foreach ($server in @($Cfg.NTP_PRIMARY_SERVER,$Cfg.NTP_BACKUP_SERVER)) {
-        $samples = & w32tm.exe /stripchart "/computer:$server" /dataonly /samples:3
-        $sampleCode = $LASTEXITCODE
-        $samples | Write-Host
-        $validSamples = @($samples | Where-Object { $_ -match '^\s*\d{1,2}:\d{2}:\d{2}.*[+-]\d+[.,]\d+s\s*$' })
-        Test-Result ($sampleCode -eq 0 -and $validSamples.Count -gt 0) "Reponse NTP de $server"
+    Test-Result $validRule 'Regle active du projet conforme'
+    $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
+    Test-Result (@($profiles | Where-Object Enabled -ne 'True').Count -eq 0) 'Pare-feu Windows active sur tous les profils'
+    Write-Host '[INFO] Les autres regles et Security Groups doivent etre controles separement.'
+    Write-Host '[3/5] Source active et reponse locale NTP (sans forcer le service)...'
+    $deadline = [datetime]::UtcNow.AddSeconds($WaitSeconds)
+    do {
+        $source = (& w32tm.exe /query /source 2>&1 | Out-String).Trim(); $sourceCode = $LASTEXITCODE
+        $name = ($source -split ',')[0].Trim()
+        $primary = $sourceCode -eq 0 -and (Test-SourceName $name $Cfg.NTP_PRIMARY_SERVER)
+        $backup = $false; foreach ($candidate in $Cfg.BACKUP_HOSTS) { if (Test-SourceName $name $candidate) { $backup = $true; break } }
+        $sourceOK = switch ($Mode) { 'Failover' { $backup } 'Any' { $primary -or $backup } default { $primary } }
+        $local = Get-NtpProbe '127.0.0.1'
+        $maxAge = [math]::Max(300,3*[math]::Pow(2,$Cfg.NTP_MAX_POLL_INTERVAL))
+        $localOK = $local.Valid -and $local.RootDistance -lt $Cfg.NTP_MAX_ROOT_DISTANCE -and $local.ReferenceAge -ge -5 -and $local.ReferenceAge -le $maxAge
+        Write-Host "Source active : $source"; Show-Probe $local
+        if ($sourceOK -and $localOK) { break }
+        $remaining = ($deadline - [datetime]::UtcNow).TotalSeconds
+        if ($remaining -le 0) { break }
+        Start-Sleep -Seconds ([int][math]::Min(10,[math]::Ceiling($remaining)))
+    } while ($true)
+    Test-Result $sourceOK "Source attendue pour le mode $Mode"
+    Test-Result $localOK 'Reponse locale synchronisee, recente et distance annoncee sous la limite'
+    Invoke-W32Time -Arguments @('/query','/status','/verbose')
+    Write-Host '[4/5] Requetes NTP vers les sources...'
+    $p1 = Get-NtpProbe $Cfg.NTP_PRIMARY_SERVER; Show-Probe $p1
+    $backupProbes = @($Cfg.BACKUP_HOSTS | ForEach-Object { Get-NtpProbe $_ })
+    foreach ($probe in $backupProbes) { Show-Probe $probe }
+    $validBackups = @($backupProbes | Where-Object { $_.Valid -and $_.RootDistance -lt $Cfg.NTP_MAX_ROOT_DISTANCE })
+    if ($Mode -eq 'Failover') {
+        Test-Result (-not $p1.Valid) 'Source principale indisponible ou non synchronisee'
+        Test-Result (@($validBackups | Where-Object { Test-SourceName $name $_.Name }).Count -gt 0) 'Source de secours selectionnee et joignable'
+    } elseif ($Mode -eq 'Any') {
+        Test-Result (($primary -and $p1.Valid) -or ($backup -and $validBackups.Count -gt 0)) 'Source active repond aux requetes NTP'
+    } else {
+        Test-Result $p1.Valid 'Source principale synchronisee'
+        Test-Result ($validBackups.Count -gt 0) 'Au moins une source de secours disponible'
     }
-
-    Write-Host '===============================' -ForegroundColor Cyan
-    if ($script:Errors -eq 0) { Write-Host '[OK] Verifications locales et sources NTP valides.' -ForegroundColor Green }
-    else { Write-Host "[ERREUR] $script:Errors verification(s) en echec." -ForegroundColor Red }
-    Write-Host '[INFO] Verifier manuellement Leap, Stratum et Root Dispersion ci-dessus.' -ForegroundColor Yellow
-    Write-Host '[INFO] Le test depuis le client Linux et le failover complet doivent etre effectues separement.' -ForegroundColor Yellow
-    exit $script:Errors
-} catch {
-    Write-Host "[ERREUR] $_" -ForegroundColor Red
-    exit 1
-}
+    Write-Host '[5/5] Journaux Windows Time (preuves de demonstration)...'
+    $events = @(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Time-Service';StartTime=(Get-Date).AddHours(-24)} -MaxEvents 15 -ErrorAction SilentlyContinue)
+    if ($events.Count -gt 0) { $events | Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List | Out-Host }
+    else { Write-Warning 'Aucun evenement System recent. Verifier aussi le canal Operational.' }
+    Write-Host '[INFO] Une sonde locale ne remplace pas le test depuis le client Linux. Correlation des journaux avec la panne necessaire.'
+    if ($script:Errors -eq 0) { Write-Host "[OK] Validation Windows $Mode reussie." -ForegroundColor Green; $exitCode = 0 }
+    else { Write-Host "[ECHEC] $script:Errors verification(s) non validee(s)." -ForegroundColor Red; $exitCode = 2 }
+} catch { Write-Host "[ERREUR] $_" -ForegroundColor Red; $exitCode = 1 }
+finally { if ($logging) { Stop-Transcript | Out-Null } }
+exit $exitCode
