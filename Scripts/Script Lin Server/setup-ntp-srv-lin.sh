@@ -6,11 +6,17 @@ set -euo pipefail
 CONF=/etc/ntpsec/ntp.conf
 SERVERS="0.ie.pool.ntp.org 1.ie.pool.ntp.org 2.ie.pool.ntp.org 3.ie.pool.ntp.org"
 CLIENT_SUBNET="10.0.2.0"
-CLIENT_MASK="255.255.255.0"
+CLIENT_MASK="255.255.255.240"
 
 # Installation
 apt-get update
 apt-get install -y ntpsec
+
+# Timezone locale (confort admin — n'affecte pas le service NTP qui reste en UTC)
+timedatectl set-timezone Europe/Zurich
+
+# Répertoire de log
+mkdir -p /var/log/ntpsec
 
 # Écrire la config complète (ordre important : restrict avant server)
 cat > "$CONF" <<EOF
@@ -29,7 +35,7 @@ restrict -6 default kod nomodify notrap nopeer noquery
 restrict 127.0.0.1
 restrict ::1
 
-# Sous-réseau clients
+# Sous-réseau clients (adapter à votre réseau)
 restrict ${CLIENT_SUBNET} mask ${CLIENT_MASK} nomodify notrap nopeer
 
 # Pools upstream
@@ -68,5 +74,8 @@ synced || { echo "ECHEC : pas de synchronisation."; exit 1; }
 
 # Stratum
 ntpq -c rv | grep -o 'stratum=[0-9]*'
+
+# Confirmation timezone
+timedatectl
 
 echo "C'est bon"
