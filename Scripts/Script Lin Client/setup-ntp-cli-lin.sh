@@ -3,10 +3,10 @@
 # setup-ntp-cli-lin.sh
 # Projet  : LIN3 - déploiement NTP
 # Cible   : client Linux Ubuntu Server (ntp-cli-lin)
-# Rôle    : met à jour le système, fixe le fuseau horaire, configure chrony
-#           avec UNIQUEMENT les serveurs NTP internes (sources par défaut
-#           neutralisées), puis vérifie le résultat (y compris la réception
-#           effective de paquets NTP).
+# Rôle    : met à jour le système, fixe le fuseau horaire, réécrit entièrement
+#           chrony.conf (sauvegarde .bak conservée) avec UNIQUEMENT les
+#           serveurs NTP internes, puis vérifie le résultat (y compris la
+#           réception effective de paquets NTP).
 #
 # Usage   : ./setup-ntp-cli-lin.sh   (se relance automatiquement en root)
 # Le réseau n'est pas modifié par ce script.
@@ -22,10 +22,6 @@ CAPTURE_TIMEOUT=$SYNC_TIMEOUT   # durée max de la capture des paquets NTP
 # ========================================
 
 CONF="/etc/chrony/chrony.conf"
-SRC_DIR="/etc/chrony/sources.d"
-CONF_DIR="/etc/chrony/conf.d"
-SRC_FILE="$SRC_DIR/local-ntp.sources"
-MARK="# ajouté par setup-ntp-cli-lin.sh"
 SRV=("$NTP_PRIMARY" "$NTP_FALLBACK")
 
 # ---------- Auto-élévation en root ----------
@@ -83,33 +79,28 @@ echo "Fuseau horaire défini : $TIMEZONE"
 
 # ---------- 4. Configuration de chrony ----------
 step "4. Configuration de chrony"
-mkdir -p "$SRC_DIR"
-cp -a "$CONF" "$CONF.bak.$(date +%Y%m%d%H%M%S)"
-echo "Sauvegarde : $CONF.bak.*"
+BAK="$CONF.bak.$(date +%Y%m%d%H%M%S)"
+cp -a "$CONF" "$BAK"
+echo "Sauvegarde : $BAK"
 
-# Retire d'abord notre ligne sourcedir d'un run précédent (idempotence)
-sed -i "\|$MARK|d" "$CONF"
+cat > "$CONF" <<EOF
+# Configuration chrony - générée par setup-ntp-cli-lin.sh (LIN3)
+# Serveurs NTP internes uniquement
 
-# Neutralise toute autre source : pool, server, peer, sourcedir (DHCP/cloud inclus)
-disable_sources() {
-  sed -i -E 's/^[[:space:]]*(pool|server|peer|sourcedir)[[:space:]]/#&/' "$1"
-}
-disable_sources "$CONF"
-for f in "$SRC_DIR"/*.sources "$CONF_DIR"/*.conf; do
-  if [[ -e "$f" && "$f" != "$SRC_FILE" ]]; then
-    disable_sources "$f"
-    echo "Sources neutralisées dans : $f"
-  fi
-done
-
-# Chrony ne lit que notre dossier de sources
-echo "sourcedir $SRC_DIR  $MARK" >> "$CONF"
-
-cat > "$SRC_FILE" <<EOF
 server ${NTP_PRIMARY}  iburst prefer minpoll 4 maxpoll 6
 server ${NTP_FALLBACK} iburst minpoll 4 maxpoll 6
+
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+ntsdumpdir /var/lib/chrony
+logdir /var/log/chrony
+maxupdateskew 100.0
+rtcsync
+makestep 1 3
+leapsectz right/UTC
 EOF
-echo "Serveurs NTP : ${SRV[*]} (dans $SRC_FILE)"
+chmod 644 "$CONF"
+echo "Configuration réécrite : $CONF (serveurs : ${SRV[*]})"
 
 # ---------- 5. Activation ----------
 step "5. Activation du service"
@@ -165,17 +156,14 @@ else fail "chrony non activé au démarrage" "$out"; fi
 if systemctl is-active --quiet chrony; then ok "chrony en cours d'exécution"
 else fail "chrony inactif" "$(systemctl status chrony --no-pager -n 5 2>&1 | tail -n 5)"; fi
 
-# 6.5 Sources par défaut neutralisées
-active=$(grep -HE '^[[:space:]]*(pool|server|peer)[[:space:]]' \
-           "$CONF" "$CONF_DIR"/*.conf "$SRC_DIR"/*.sources 2>/dev/null \
-         | grep -v "^$SRC_FILE:" || true)
-extra_dirs=$(grep -hE '^[[:space:]]*sourcedir[[:space:]]' \
-               "$CONF" "$CONF_DIR"/*.conf 2>/dev/null \
-             | grep -v "sourcedir $SRC_DIR " || true)
-if [[ -z "$active" && -z "$extra_dirs" ]]; then
-  ok "Aucune source par défaut active (seul $SRC_DIR est lu)"
+# 6.5 Seuls nos serveurs sont déclarés
+extra=$(grep -E '^[[:space:]]*(pool|peer|sourcedir|confdir)[[:space:]]' "$CONF" || true)
+other=$(grep -E '^[[:space:]]*server[[:space:]]' "$CONF" | awk '{print $2}' \
+        | grep -vxF -e "$NTP_PRIMARY" -e "$NTP_FALLBACK" || true)
+if [[ -z "$extra" && -z "$other" ]]; then
+  ok "chrony.conf ne déclare que les serveurs internes"
 else
-  fail "Source(s) par défaut encore active(s)" "$active $extra_dirs"
+  fail "Source(s) ou répertoire(s) inattendu(s) dans $CONF" "$extra $other"
 fi
 
 # 6.6 Connectivité vers chaque serveur
