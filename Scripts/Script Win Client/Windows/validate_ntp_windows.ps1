@@ -49,6 +49,10 @@ function Read-NtpConfig {
     }
     $zone = @(Get-TimeZone -ListAvailable | Where-Object Id -eq $c.TZ_NAME)
     if ($zone.Count -ne 1) { throw "Fuseau Windows invalide : $($c.TZ_NAME)" }
+    # Site LIN3: enforce the two peers and the permitted remote subnet.
+    if ($c.TZ_NAME -ne 'W. Europe Standard Time' -or $c.NTP_PRIMARY_SERVER -ne '10.0.2.10' -or $c.NTP_POOL -ne 'ie.pool.ntp.org' -or @($c.BACKUP_HOSTS).Count -ne 1 -or $c.NTP_ALLOWED_SUBNET -ne '10.0.2.0/28') {
+        throw 'Invalid site settings: use the corrected .env.windows.txt (Swiss TZ, two peers, 10.0.2.0/28 only).'
+    }
     $defaults = @{NTP_MIN_POLL_INTERVAL=6; NTP_MAX_POLL_INTERVAL=6; NTP_UPDATE_INTERVAL=100; NTP_ANNOUNCE_FLAGS=10; NTP_EVENT_LOG_FLAGS=3; NTP_DISABLE_VMIC=1; NTP_MAX_ROOT_DISTANCE=5; NTP_INSTALL_WAIT_SECONDS=120}
     foreach ($key in $defaults.Keys) {
         if (-not $c.ContainsKey($key)) { $c[$key] = $defaults[$key] }
@@ -57,6 +61,7 @@ function Read-NtpConfig {
         $c[$key] = $n
     }
     if ($c.NTP_MIN_POLL_INTERVAL -lt 6 -or $c.NTP_MAX_POLL_INTERVAL -gt 15 -or $c.NTP_MIN_POLL_INTERVAL -gt $c.NTP_MAX_POLL_INTERVAL -or $c.NTP_UPDATE_INTERVAL -lt 1 -or $c.NTP_ANNOUNCE_FLAGS -ne 10 -or $c.NTP_EVENT_LOG_FLAGS -ne 3 -or $c.NTP_DISABLE_VMIC -notin @(0,1) -or $c.NTP_MAX_ROOT_DISTANCE -lt 1 -or $c.NTP_MAX_ROOT_DISTANCE -gt 5 -or $c.NTP_INSTALL_WAIT_SECONDS -lt 0 -or $c.NTP_INSTALL_WAIT_SECONDS -gt 3600) { throw 'Parametres NTP hors limites.' }
+    if ($c.NTP_DISABLE_VMIC -ne 1) { throw 'VMIC must remain disabled for this deployment.' }
     return $c
 }
 function Invoke-W32Time([string[]]$Arguments) {
@@ -134,12 +139,64 @@ function Test-SourceName([string]$Actual,[string]$Expected) {
     $addresses = @(Get-IPv4 $Expected | ForEach-Object { $_.IPAddressToString })
     return ($addresses -contains $Actual)
 }
+
+# Conservative audit of rules potentially matching W32Time inbound UDP/123.
+function Test-OnlyAllowedAddress($Address) {
+    $a = @($Address)
+    return ($a.Count -eq 1 -and $a[0] -in @('10.0.2.0/28','10.0.2.0/255.255.255.240','10.0.2.0-10.0.2.15'))
+}
+# V4: explicit service-scoped deny outside the permitted IPv4 network.
+# Windows Firewall gives explicit blocks precedence over ordinary allow rules.
+# Stateful UDP replies to outbound queries must still be verified in practice.
+$NtpDenyScopes = @{
+    'LIN3-NTP-Deny-IPv4' = @('0.0.0.0-10.0.1.255','10.0.2.16-255.255.255.255')
+    'LIN3-NTP-Deny-IPv6' = @('::/1','8000::/1')
+}
+function Normalize-NtpScope([string]$Address) {
+    switch ($Address) {
+        '::/8000::' { return '::/1' }
+        '8000::/8000::' { return '8000::/1' }
+        '::-7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' { return '::/1' }
+        '8000::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' { return '8000::/1' }
+        default { return $Address }
+    }
+}
+function Test-NtpDenyRules {
+    foreach ($name in $NtpDenyScopes.Keys) {
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $name -ErrorAction SilentlyContinue)
+        if ($rules.Count -ne 1) { return $false }
+        $r = $rules[0]
+        $p = $r | Get-NetFirewallPortFilter
+        $a = $r | Get-NetFirewallAddressFilter
+        $s = $r | Get-NetFirewallServiceFilter
+        $app = $r | Get-NetFirewallApplicationFilter
+        $actual = @($a.RemoteAddress | ForEach-Object { Normalize-NtpScope $_ } | Sort-Object)
+        $expected = @($NtpDenyScopes[$name] | Sort-Object)
+        if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Inbound' -or $r.Action -ne 'Block' -or $r.Profile -ne 'Any' -or
+            [string]$p.Protocol -notin @('UDP','17') -or [string]$p.LocalPort -ne '123' -or [string]$p.RemotePort -ne 'Any' -or
+            [string]$s.Service -ne 'W32Time' -or [string]$app.Program -ne 'Any' -or [string]$a.LocalAddress -ne 'Any' -or
+            ($actual -join '|') -ne ($expected -join '|')) { return $false }
+    }
+    return $true
+}
+function Get-NtpBypassRules {
+    # Authenticated IPsec bypass rules are an exception to block precedence.
+    # Check all enabled inbound bypass rules, rather than assuming their scope.
+    foreach ($r in @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow)) {
+        $security = $r | Get-NetFirewallSecurityFilter
+        if ([string]$security.OverrideBlockRules -eq 'True') { $r }
+    }
+}
+
 $exitCode = 1; $logging = $false
 try {
     Assert-Administrator
     $Cfg = Read-NtpConfig
     Start-NtpLog "validate-$Mode"; $logging = $true
-    Write-Host "LIN3 | Validation NTP V4 | Mode $Mode" -ForegroundColor Cyan
+    Write-Host "LIN3 | Validation NTP V4 - explicit deny | Mode $Mode" -ForegroundColor Cyan
+    Write-Host "Date et heure suisse : $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss zzz')"
+    Get-TimeZone | Format-List Id,DisplayName,SupportsDaylightSavingTime | Out-Host
+    Write-Host "UTC : $([datetime]::UtcNow.ToString('dd.MM.yyyy HH:mm:ss'))"
     Write-Host '[1/5] Service, fournisseurs et configuration...'
     Test-Result ((Get-TimeZone).Id -eq $Cfg.TZ_NAME) "Fuseau horaire : $($Cfg.TZ_NAME)"
     $svc = Get-CimInstance Win32_Service -Filter "Name='W32Time'"
@@ -169,7 +226,7 @@ try {
     if ($rules.Count -eq 1) {
         $r = $rules[0]; $port = $r | Get-NetFirewallPortFilter; $addr = $r | Get-NetFirewallAddressFilter
         $actual = @($addr.RemoteAddress); $expected = $Cfg.NTP_ALLOWED_SUBNET
-        $match = $actual.Count -eq 1 -and $actual[0] -eq $expected
+        $match = Test-OnlyAllowedAddress $actual
         if ($expected -eq 'LocalSubnet') { $match = $actual.Count -gt 0 -and @($actual | Where-Object { $_ -notin @('LocalSubnet','LocalSubnet4','LocalSubnet6') }).Count -eq 0 }
         # Windows peut normaliser CIDR en adresse/masque.
         if (-not $match -and $expected -match '/') {
@@ -177,12 +234,16 @@ try {
             $mask = (0..3 | ForEach-Object { $n=[math]::Min(8,[math]::Max(0,$bits-8*$_)); [int](256-[math]::Pow(2,8-$n)) }) -join '.'
             $match = $actual.Count -eq 1 -and $actual[0] -eq "$($parts[0])/$mask"
         }
-        $validRule = $r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Allow' -and $r.Profile -eq 'Any' -and $port.Protocol -in @('UDP','17') -and [string]$port.LocalPort -eq '123' -and $match
+        $validRule = $r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Allow' -and $r.Profile -eq 'Any' -and $port.Protocol -in @('UDP','17') -and [string]$port.LocalPort -eq '123' -and $match -and [string]($r | Get-NetFirewallServiceFilter).Service -eq 'W32Time'
     }
     Test-Result $validRule 'Regle active du projet conforme'
     $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
-    Test-Result (@($profiles | Where-Object Enabled -ne 'True').Count -eq 0) 'Pare-feu Windows active sur tous les profils'
-    Write-Host '[INFO] Les autres regles et Security Groups doivent etre controles separement.'
+    Test-Result (@($profiles | Where-Object { $_.Enabled -ne 'True' -or $_.DefaultInboundAction -ne 'Block' -or $_.AllowInboundRules -eq 'False' }).Count -eq 0) 'Pare-feu actif, trafic entrant bloque par defaut'
+    Test-Result (Test-NtpDenyRules) 'Regles de refus explicite IPv4 hors du /28 et IPv6 actives'
+    $bypass = @(Get-NtpBypassRules)
+    if ($bypass.Count) { $bypass | Select-Object Name,DisplayName | Format-Table -AutoSize | Out-Host }
+    Test-Result ($bypass.Count -eq 0) 'Aucun contournement IPsec entrant detecte'
+    Write-Host '[INFO] Tester depuis une IP de 10.0.2.0/28 et une IP hors de ce sous-reseau. Les regles cloud restent a verifier.'
     Write-Host '[3/5] Source active et reponse locale NTP (sans forcer le service)...'
     $deadline = [datetime]::UtcNow.AddSeconds($WaitSeconds)
     do {
@@ -218,7 +279,11 @@ try {
         Test-Result ($validBackups.Count -gt 0) 'Au moins une source de secours disponible'
     }
     Write-Host '[5/5] Journaux Windows Time (preuves de demonstration)...'
-    $events = @(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Time-Service';StartTime=(Get-Date).AddHours(-24)} -MaxEvents 15 -ErrorAction SilentlyContinue)
+    $since = (Get-Date).AddMinutes(-15)
+    $marker = Join-Path $PSScriptRoot 'logs\last-install-utc.txt'
+    if (Test-Path -LiteralPath $marker) { $since = [datetime]::Parse((Get-Content -LiteralPath $marker -Raw).Trim()).ToLocalTime() }
+    Write-Host "Evenements depuis : $since"
+    $events = @(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Time-Service';StartTime=$since} -MaxEvents 15 -ErrorAction SilentlyContinue)
     if ($events.Count -gt 0) { $events | Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List | Out-Host }
     else { Write-Warning 'Aucun evenement System recent. Verifier aussi le canal Operational.' }
     Write-Host '[INFO] Une sonde locale ne remplace pas le test depuis le client Linux. Correlation des journaux avec la panne necessaire.'
